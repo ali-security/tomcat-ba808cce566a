@@ -42,6 +42,7 @@ import org.apache.catalina.startup.Tomcat;
 import org.apache.tomcat.util.compat.JrePlatform;
 import org.apache.tomcat.util.http.FastHttpDateFormat;
 import org.apache.tomcat.util.http.Method;
+import org.apache.tomcat.util.http.MimeHeaders;
 
 public class TestStreamProcessor extends Http2TestBase {
 
@@ -432,6 +433,84 @@ public class TestStreamProcessor extends Http2TestBase {
 
         // The status code is the most important thing to test
         Assert.assertTrue(output.getTrace().startsWith(expected.toString()));
+    }
+
+
+    @Test
+    public void testBadRequestNoteClearedOnRecycle() throws Exception {
+        http2Connect();
+
+        // Disable overhead protection for window update as it breaks some tests
+        http2Protocol.setOverheadWindowUpdateThreshold(0);
+
+        byte[] headersFrameHeader = new byte[9];
+        ByteBuffer headersPayload = ByteBuffer.allocate(128);
+        byte[] dataFrameHeader = new byte[9];
+        ByteBuffer dataPayload = ByteBuffer.allocate(256);
+
+        // Valid POST request with a body but without end of stream (trailers will follow)
+        buildPostRequest(headersFrameHeader, headersPayload, false, dataFrameHeader, dataPayload, null, true, 3);
+        writeFrame(headersFrameHeader, headersPayload);
+        writeFrame(dataFrameHeader, dataPayload);
+
+        /*
+         * Wait for the window update for stream 3. That is only sent once the servlet starts reading the request body
+         * which means the request has already passed StreamProcessor.validateRequest().
+         */
+        int frameCount = 0;
+        while (!output.getTrace().contains("3-WindowSize-[") && frameCount < 10) {
+            parser.readFrame();
+            frameCount++;
+        }
+        Assert.assertTrue(output.getTrace(), output.getTrace().contains("3-WindowSize-["));
+        output.clearTrace();
+
+        // Trailer with an invalid host header. This marks the request as bad after validation has completed.
+        byte[] trailerFrameHeader = new byte[9];
+        ByteBuffer trailerPayload = ByteBuffer.allocate(256);
+        MimeHeaders trailerHeaders = new MimeHeaders();
+        trailerHeaders.addValue("host").setString("local!host:" + getPort());
+        hpackEncoder.encode(trailerHeaders, trailerPayload);
+        trailerPayload.flip();
+        ByteUtil.setThreeBytes(trailerFrameHeader, 0, trailerPayload.limit());
+        trailerFrameHeader[3] = FrameType.HEADERS.getIdByte();
+        // Flags. end of headers (0x04) and end of stream (0x01)
+        trailerFrameHeader[4] = 0x05;
+        ByteUtil.set31Bits(trailerFrameHeader, 5, 3);
+        writeFrame(trailerFrameHeader, trailerPayload);
+
+        // Read the complete response for stream 3
+        frameCount = 0;
+        while (!output.getTrace().contains("3-EndOfStream") && frameCount < 10) {
+            parser.readFrame();
+            frameCount++;
+        }
+        String trace = output.getTrace();
+        Assert.assertTrue(trace, trace.contains("3-Header-[:status]-[200]"));
+        Assert.assertTrue(trace, trace.contains("3-EndOfStream"));
+        output.clearTrace();
+
+        /*
+         * Wait for stream 1 (the upgrade request) and stream 3 to be fully processed so the request used for stream 3
+         * has been recycled and returned to the pool ready for re-use by the next stream.
+         */
+        int waitCount = 0;
+        while (http2Protocol.getGlobal().getRequestCount() < 2 && waitCount < 500) {
+            Thread.sleep(10);
+            waitCount++;
+        }
+        Assert.assertEquals(2, http2Protocol.getGlobal().getRequestCount());
+
+        // The next stream re-uses the recycled request. It must not be rejected.
+        sendSimpleGetRequest(5);
+
+        frameCount = 0;
+        while (!output.getTrace().contains("5-EndOfStream") && frameCount < 10) {
+            parser.readFrame();
+            frameCount++;
+        }
+
+        Assert.assertEquals(getSimpleResponseTrace(5), output.getTrace());
     }
 
 
