@@ -148,7 +148,214 @@ public class TestDataSourceRealm extends LoggingBaseTest {
         List<String> roles = db.getRoles("tomcat");
         Assert.assertEquals(2, roles.size());
 
-        db.stop();
+        p = db.getPrincipal("blabla");
+        Assert.assertNull(p);
 
+        p = db.getPrincipal("random");
+        Assert.assertTrue(p instanceof GenericPrincipal);
+        gp = (GenericPrincipal) p;
+        Assert.assertEquals(0, gp.getRoles().length);
+
+        db.stop();
+    }
+
+    @Test
+    public void testRealmWithoutRoleStore() throws Exception {
+
+        db = new DerbyDataSourceRealm("dsRealmNoRoles");
+        db.setUserTable("users");
+        db.setUserNameCol("user_name");
+        db.setUserCredCol("user_pass");
+
+        // Create only the users table, no role store is configured
+        Connection connection = db.open();
+        for (String sql: SIMPLE_SCHEMA.split(";")) {
+            if (sql.contains("user_roles")) {
+                continue;
+            }
+            try (Statement statement = connection.createStatement()) {
+                statement.execute(sql);
+            }
+        }
+
+        try (PreparedStatement stmt = connection.prepareStatement(USERS_INSERT)) {
+            stmt.setString(1, "tomcat");
+            stmt.setString(2, "password");
+            stmt.executeUpdate();
+        }
+
+        db.start();
+
+        // Default strict mode with no role store. Authentication of a valid
+        // user must succeed with an empty role list rather than fail.
+        Principal p = db.authenticate("tomcat", "bar");
+        Assert.assertNull(p);
+
+        p = db.authenticate("tomcat", "password");
+        Assert.assertTrue(p instanceof GenericPrincipal);
+        GenericPrincipal gp = (GenericPrincipal) p;
+        Assert.assertEquals(0, gp.getRoles().length);
+
+        p = db.getPrincipal("tomcat");
+        Assert.assertTrue(p instanceof GenericPrincipal);
+        gp = (GenericPrincipal) p;
+        Assert.assertEquals(0, gp.getRoles().length);
+
+        List<String> roles = db.getRoles("tomcat");
+        Assert.assertNotNull(roles);
+        Assert.assertEquals(0, roles.size());
+
+        db.stop();
+    }
+
+    @Test
+    public void testUnknownUserWithoutPassword() throws Exception {
+
+        db = new DerbyDataSourceRealm("dsRealmUnknownUser");
+        db.setUserTable("users");
+        db.setUserNameCol("user_name");
+        db.setUserCredCol("user_pass");
+        db.setUserRoleTable("user_roles");
+        db.setRoleNameCol("role_name");
+
+        Connection connection = db.open();
+        for (String sql: SIMPLE_SCHEMA.split(";")) {
+            try (Statement statement = connection.createStatement()) {
+                statement.execute(sql);
+            }
+        }
+
+        try (PreparedStatement stmt = connection.prepareStatement(USERS_INSERT)) {
+            stmt.setString(1, "tomcat");
+            stmt.setString(2, "password");
+            stmt.executeUpdate();
+        }
+        try (PreparedStatement stmt = connection.prepareStatement(ROLES_INSERT)) {
+            stmt.setString(1, "tomcat");
+            stmt.setString(2, "admin");
+            stmt.executeUpdate();
+        }
+
+        db.start();
+
+        // CLIENT-CERT and SPNEGO authenticate by user name only. A user that
+        // does not exist in the database must not be authenticated.
+        Assert.assertNull(db.authenticate("blabla"));
+        Assert.assertNull(db.getPrincipal("blabla"));
+
+        // An existing user is still authenticated with the expected roles
+        Principal p = db.authenticate("tomcat");
+        Assert.assertTrue(p instanceof GenericPrincipal);
+        GenericPrincipal gp = (GenericPrincipal) p;
+        Assert.assertTrue(gp.hasRole("admin"));
+
+        db.stop();
+    }
+
+    @Test
+    public void testUserLookupFailure() throws Exception {
+
+        db = new DerbyDataSourceRealm("dsRealmNoUserTable");
+        db.setUserTable("users");
+        db.setUserNameCol("user_name");
+        db.setUserCredCol("user_pass");
+        db.setUserRoleTable("user_roles");
+        db.setRoleNameCol("role_name");
+
+        // Create only the roles table so that the user lookup fails
+        Connection connection = db.open();
+        for (String sql: SIMPLE_SCHEMA.split(";")) {
+            if (!sql.contains("user_roles")) {
+                continue;
+            }
+            try (Statement statement = connection.createStatement()) {
+                statement.execute(sql);
+            }
+        }
+
+        try (PreparedStatement stmt = connection.prepareStatement(ROLES_INSERT)) {
+            stmt.setString(1, "tomcat");
+            stmt.setString(2, "admin");
+            stmt.executeUpdate();
+        }
+
+        db.start();
+
+        // An exception during the user lookup must result in an
+        // authentication failure rather than a populated Principal
+        Assert.assertNull(db.authenticate("tomcat", "password"));
+        Assert.assertNull(db.authenticate("tomcat"));
+        Assert.assertNull(db.getPrincipal("tomcat"));
+
+        db.stop();
+    }
+
+    @Test
+    public void testRoleLookupFailure() throws Exception {
+
+        db = new DerbyDataSourceRealm("dsRealmNoRoleTable");
+        db.setUserTable("users");
+        db.setUserNameCol("user_name");
+        db.setUserCredCol("user_pass");
+        db.setUserRoleTable("user_roles");
+        db.setRoleNameCol("role_name");
+
+        // Create only the users table so that the configured role lookup fails
+        Connection connection = db.open();
+        for (String sql: SIMPLE_SCHEMA.split(";")) {
+            if (sql.contains("user_roles")) {
+                continue;
+            }
+            try (Statement statement = connection.createStatement()) {
+                statement.execute(sql);
+            }
+        }
+
+        try (PreparedStatement stmt = connection.prepareStatement(USERS_INSERT)) {
+            stmt.setString(1, "tomcat");
+            stmt.setString(2, "password");
+            stmt.executeUpdate();
+        }
+
+        db.start();
+
+        // An exception during the role lookup must result in an
+        // authentication failure rather than a partially populated Principal
+        Assert.assertNull(db.getRoles("tomcat"));
+        Assert.assertNull(db.authenticate("tomcat", "password"));
+        Assert.assertNull(db.authenticate("tomcat"));
+        Assert.assertNull(db.getPrincipal("tomcat"));
+
+        db.stop();
+    }
+
+    @Test
+    public void testDatabaseUnavailable() throws Exception {
+
+        // No container so no global naming context and no DataSource. Every
+        // attempt to open a database connection fails.
+        DataSourceRealm realm = new DataSourceRealm() {
+            @Override
+            public void initInternal() throws LifecycleException {
+                containerLog = log;
+            }
+        };
+        realm.setDataSourceName("jdbc/missing");
+        realm.setUserTable("users");
+        realm.setUserNameCol("user_name");
+        realm.setUserCredCol("user_pass");
+        realm.setUserRoleTable("user_roles");
+        realm.setRoleNameCol("role_name");
+
+        realm.start();
+
+        // A failure to connect to the database must result in an
+        // authentication failure rather than an unvalidated Principal
+        Assert.assertNull(realm.authenticate("tomcat", "password"));
+        Assert.assertNull(realm.authenticate("tomcat"));
+        Assert.assertNull(realm.getPrincipal("tomcat"));
+        Assert.assertFalse(realm.isAvailable());
+
+        realm.stop();
     }
 }
