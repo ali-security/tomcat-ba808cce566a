@@ -16,9 +16,11 @@
  */
 package org.apache.catalina.valves.rewrite;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.io.StringReader;
 import java.net.HttpURLConnection;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -26,6 +28,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.Cookie;
@@ -44,6 +47,7 @@ import org.apache.catalina.startup.TesterServlet;
 import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
 import org.apache.catalina.valves.ValveBase;
+import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.util.buf.ByteChunk;
 import org.apache.tomcat.util.http.Method;
 
@@ -86,6 +90,102 @@ public class TestRewriteValve extends TomcatBaseTest {
     @Test
     public void testNonNormalizedPathRewrite() throws Exception {
         doTestRewrite("RewriteRule ^/b/(.*) /b/../a/$1", "/b/%255A", "/b/../a/%255A");
+    }
+
+    @Test
+    public void testChainMatch() throws Exception {
+        // The first rule matches so the chained (second) rule is applied to the result
+        doTestRewrite("RewriteRule ^/a(.*) /b$1 [C]\n" +
+                "RewriteRule ^/b(.*) /c$1", "/a/x", "/c/x");
+    }
+
+    @Test
+    public void testChainHeadNoMatch() throws Exception {
+        // The first rule does not match so the whole chain, including the
+        // terminal rule that would otherwise match, must be skipped. If the
+        // terminal rule were incorrectly applied the request would be rewritten
+        // to /W/x.
+        doTestRewrite("RewriteRule ^/never(.*) /c$1 [C]\n" +
+                "RewriteRule ^/c(.*) /W$1", "/c/x", "/c/x");
+    }
+
+    @Test
+    public void testChainMiddleNoMatch() throws Exception {
+        // The first rule matches but the second (chained) rule does not, so the
+        // rest of the chain, including the terminal rule, must be skipped and
+        // the result of the first rule is retained. If the terminal rule were
+        // incorrectly applied the request would be rewritten to /W/y.
+        doTestRewrite("RewriteRule ^/a(.*) /c$1 [C]\n" +
+                "RewriteRule ^/nomatch(.*) /x$1 [C]\n" +
+                "RewriteRule ^/c(.*) /W$1", "/a/y", "/c/y");
+    }
+
+    @Test
+    public void testChainTrailingNoMatch() throws Exception {
+        // The first rule does not match so the rest of the chain must be
+        // skipped, even when every remaining rule has the chain flag set. If
+        // the chained rule were incorrectly applied the request would be
+        // rewritten to /W/x.
+        doTestRewrite("RewriteRule ^/never(.*) /c$1 [C]\n" +
+                "RewriteRule ^/c(.*) /W$1 [C]", "/c/x", "/c/x");
+    }
+
+    @Test
+    public void testNextRestartsAtFirstRule() throws Exception {
+        // The [N] flag must restart processing with the first rule. If the
+        // first rule were skipped the request would end up at /c/bx.
+        doTestRewrite("RewriteRule ^/c/b(.*) /c/d$1\n" +
+                "RewriteRule ^/c/a(.*) /c/b$1 [N]", "/c/ax", "/c/dx");
+    }
+
+    @Test
+    public void testNextDoesNotBypassFirstRule() throws Exception {
+        // The [N] flag must restart processing with the first rule so a later
+        // rule cannot be used to rewrite a request into a path that the first
+        // rule forbids.
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = getProgrammaticRootContext();
+
+        RewriteValve rewriteValve = new RewriteValve();
+        ctx.getPipeline().addValve(rewriteValve);
+
+        rewriteValve.setConfiguration("RewriteRule ^/c/secret.* - [F]\n" +
+                "RewriteRule ^/c/public(.*) /c/secret$1 [N]");
+
+        Tomcat.addServlet(ctx, "snoop", new SnoopServlet());
+        ctx.addServletMappingDecoded("/c/*", "snoop");
+
+        tomcat.start();
+
+        ByteChunk res = new ByteChunk();
+        int rc = getUrl("http://localhost:" + getPort() + "/c/publicx", res, null);
+        Assert.assertEquals(HttpServletResponse.SC_FORBIDDEN, rc);
+    }
+
+    @Test
+    public void testParseStopsOnReadError() throws Exception {
+        // An IOException while reading the configuration must stop parsing
+        // rather than retrying the read, which could loop indefinitely.
+        RewriteValve rewriteValve = new RewriteValve() {
+            {
+                containerLog = LogFactory.getLog(RewriteValve.class);
+            }
+        };
+        AtomicInteger readCount = new AtomicInteger();
+        BufferedReader reader = new BufferedReader(new StringReader("")) {
+            @Override
+            public String readLine() throws IOException {
+                // Bound the number of failures so the test cannot hang
+                if (readCount.incrementAndGet() > 100) {
+                    return null;
+                }
+                throw new IOException();
+            }
+        };
+        rewriteValve.parse(reader);
+        Assert.assertEquals(1, readCount.get());
     }
 
     // BZ 57863
@@ -379,6 +479,14 @@ public class TestRewriteValve extends TomcatBaseTest {
     @Test
     public void testQueryStringSourceAndTargetQSAQSD() throws Exception {
         doTestRewrite("RewriteRule ^/b/(.*) /c/$1?id=1 [QSA,QSD]", "/b/d?je=2", "/c/d", "id=1");
+    }
+
+    @Test
+    public void testQueryStringQSAThenQSD() throws Exception {
+        // QSD on a later rule must discard the original query string even if
+        // an earlier rule set QSA
+        doTestRewrite("RewriteRule ^/b/(.*) /e/$1?id=1 [QSA]\n" +
+                "RewriteRule ^/e/(.*) /c/$1 [QSD]", "/b/d?je=2", "/c/d", "id=1");
     }
 
     @Test
@@ -744,6 +852,13 @@ public class TestRewriteValve extends TomcatBaseTest {
     @Test
     public void testDefaultRedirect() throws Exception {
         doTestRedirect("RewriteRule ^/from/a$ /to/b [R]", "/redirect/from/a", "/redirect/to/b", 302);
+    }
+
+    @Test
+    public void testRedirectQueryStringRemove() throws Exception {
+        // A trailing '?' removes the original query string without leaving an
+        // empty query string in the redirect
+        doTestRedirect("RewriteRule ^/from/a$ /to/b? [R]", "/redirect/from/a?id=1", "/redirect/to/b", 302);
     }
 
 
