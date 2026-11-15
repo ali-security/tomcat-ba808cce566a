@@ -22,7 +22,6 @@ import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
 
-import org.apache.tomcat.util.http.parser.HttpParser;
 import org.apache.tomcat.util.res.StringManager;
 
 public class HPackHuffman {
@@ -384,12 +383,15 @@ public class HPackHuffman {
     /**
      * Decodes a huffman encoded string into the target StringBuilder. There must be enough space left in the buffer for
      * this method to succeed.
+     * <p>
+     * No validation of the decoded characters is performed. HTTP/2 header field names and values are validated once
+     * they have been fully decoded (see {@link Stream#emitHeader(String, String)}) so that an invalid header field
+     * results in a stream error while decoding of the header block - and therefore the HPACK state - continues.
      *
      * @param data        The byte buffer
      * @param length      The length of data from the buffer to decode
      * @param target      The target for the decompressed data
-     * @param isFieldName {@code true} if a field name is being decoded (names have a more restrictive set of allowed
-     *                        characters than field values)
+     * @param isFieldName {@code true} if a field name is being decoded. Ignored.
      *
      * @throws HpackException If the Huffman encoded value in HPACK headers did not end with EOS padding
      */
@@ -400,8 +402,6 @@ public class HPackHuffman {
         int treePos = 0;
         boolean eosBits = true;
         int eosBitCount = 0;
-        boolean firstChar = true;
-        char c = 'a';
         for (int i = 0; i < length; ++i) {
             byte b = data.get();
             int bitPos = 7;
@@ -415,27 +415,7 @@ public class HPackHuffman {
                         // Found a zero, can't be counting EOS bits
                         eosBitCount = 0;
                     } else {
-                        c = (char) (val & LOW_MASK);
-                        if (isFieldName) {
-                            if (!HttpParser.isToken(c) || Character.isUpperCase(c)) {
-                                throw new IllegalArgumentException(sm
-                                        .getString("hpackhuffman.decode.illegalCharacterName", Character.toString(c)));
-                            }
-                        } else {
-                            if (firstChar) {
-                                if (!HttpParser.isFieldVChar(c)) {
-                                    throw new IllegalArgumentException(sm.getString(
-                                            "hpackhuffman.decode.illegalCharacterValue.start", Character.toString(c)));
-                                }
-                                firstChar = false;
-                            } else {
-                                if (!HttpParser.isFieldContent(c)) {
-                                    throw new IllegalArgumentException(sm.getString(
-                                            "hpackhuffman.decode.illegalCharacterValue", Character.toString(c)));
-                                }
-                            }
-                        }
-                        target.append(c);
+                        target.append((char) (val & LOW_MASK));
                         treePos = 0;
                         eosBits = true;
                         // Output a character, reset eosBitCount
@@ -454,27 +434,7 @@ public class HPackHuffman {
                             // as an error
                             throw new HpackException(sm.getString("hpackhuffman.stringLiteralEOS"));
                         }
-                        c = (char) ((val >> 16) & LOW_MASK);
-                        if (isFieldName) {
-                            if (!HttpParser.isToken(c) || Character.isUpperCase(c)) {
-                                throw new IllegalArgumentException(sm
-                                        .getString("hpackhuffman.decode.illegalCharacterName", Character.toString(c)));
-                            }
-                        } else {
-                            if (firstChar) {
-                                if (!HttpParser.isFieldVChar(c)) {
-                                    throw new IllegalArgumentException(sm.getString(
-                                            "hpackhuffman.decode.illegalCharacterValue.start", Character.toString(c)));
-                                }
-                                firstChar = false;
-                            } else {
-                                if (!HttpParser.isFieldContent(c)) {
-                                    throw new IllegalArgumentException(sm.getString(
-                                            "hpackhuffman.decode.illegalCharacterValue", Character.toString(c)));
-                                }
-                            }
-                        }
-                        target.append(c);
+                        target.append((char) ((val >> 16) & LOW_MASK));
                         treePos = 0;
                         eosBits = true;
                         // Output a character, reset eosBitCount
@@ -489,10 +449,6 @@ public class HPackHuffman {
         }
         if (!eosBits) {
             throw new HpackException(sm.getString("hpackhuffman.huffmanEncodedHpackValueDidNotEndWithEOS"));
-        }
-        if (!isFieldName && !HttpParser.isFieldVChar(c)) {
-            throw new IllegalArgumentException(
-                    sm.getString("hpackhuffman.decode.illegalCharacterValue.end", Character.toString(c)));
         }
     }
 
